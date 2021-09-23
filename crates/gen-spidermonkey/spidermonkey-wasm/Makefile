@@ -9,7 +9,7 @@ CC := $(CURDIR)/wasi-sdk-12.0/bin/clang
 CXX := $(CURDIR)/wasi-sdk-12.0/bin/clang++
 
 # Set this to `1` to enable logging via all the `SMW_LOG(...)` calls.
-LOGGING := 0
+LOGGING := 1
 
 # Set this to `-DDEBUG` and uncomment the `--enable-debug` line in `mozconfig`
 # to enable debug builds of SpiderMonkey.
@@ -120,10 +120,10 @@ mozbuild: spidermonkey-$(SM_COMMIT)
 	-mkdir mozbuild
 	cd spidermonkey-$(SM_COMMIT) \
 		&& MOZBUILD_STATE_PATH=$(CURDIR)/mozbuild ./mach bootstrap --application-choice js --no-system-changes \
-		|| rm -rf $(CURDIR)/mozbuild
 
 wasi-sdk-12.0:
-	curl -L $(WASI_SDK_URL) | tar -x -z
+	#curl -L $(WASI_SDK_URL) | tar -x -z
+	#ln -s $$WASI_SDK_PATH wasi-sdk-12.0
 
 clean-all: clean clean-spidermonkey clean-wasi-sdk
 

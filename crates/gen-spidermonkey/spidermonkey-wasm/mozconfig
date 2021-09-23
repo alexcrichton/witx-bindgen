@@ -22,6 +22,6 @@ ac_add_options --disable-shared-memory
 # `DEFINE=` in the `Makefile`.
 ac_add_options --enable-optimize
 ac_add_options --disable-debug
-# ac_add_options --enable-debug
+#ac_add_options --enable-debug
 
 mk_add_options AUTOCLOBBER=1
