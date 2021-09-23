@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, build-on-ci]
+    branches: [main, build-on-ci ]
   pull_request:
     branches: [main]
 defaults:
