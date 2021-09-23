@@ -136,4 +136,6 @@ jobs:
     - run: curl -L https://github.com/WebAssembly/binaryen/releases/download/version_101/binaryen-version_101-x86_64-linux.tar.gz | tar xzf -
     - run: echo `pwd`/binaryen-version_101/bin >> $GITHUB_PATH
 
+    - run: shasum crates/gen-spidermonkey/spidermonkey-wasm/spidermonkey.wasm
     - run: make -C crates/gen-spidermonkey/spidermonkey-wasm
+    - run: shasum crates/gen-spidermonkey/spidermonkey-wasm/spidermonkey.wasm
