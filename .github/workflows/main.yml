@@ -133,5 +133,7 @@ jobs:
       run: rustup update stable --no-self-update && rustup default stable
     - name: Install wasm32-wasi target
       run: rustup target add wasm32-wasi
+    - run: curl -L https://github.com/WebAssembly/binaryen/releases/download/version_101/binaryen-version_101-x86_64-linux.tar.gz | tar xzf -
+    - run: echo `pwd`/binaryen-version_101/bin >> $GITHUB_PATH
 
     - run: make -C crates/gen-spidermonkey/spidermonkey-wasm
