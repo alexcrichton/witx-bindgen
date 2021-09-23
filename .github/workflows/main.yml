@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, build-on-ci]
   pull_request:
     branches: [main]
 defaults:
@@ -123,3 +123,15 @@ jobs:
       run: cargo run --release -p wasmlink-cli -- -m markdown=crates/wasmlink/demo/markdown/target/wasm32-wasi/release/markdown.wasm -i markdown=crates/wasmlink/demo/markdown/markdown.witx -p wasmtime -o linked.wasm crates/wasmlink/demo/renderer/target/wasm32-wasi/release/renderer.wasm
     - name: Run the linked component with Wasmtime
       run: printf '# Hello\nworld' | /tmp/wasmtime/wasmtime --enable-module-linking --enable-multi-memory linked.wasm | grep -q '<h1>Hello</h1>'
+
+  build-sm:
+    name: Build Spidermonkey
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    - name: Install Rust
+      run: rustup update stable --no-self-update && rustup default stable
+    - name: Install wasm32-wasi target
+      run: rustup target add wasm32-wasi
+
+    - run: make -C crates/gen-spidermonkey/spidermonkey-wasm
