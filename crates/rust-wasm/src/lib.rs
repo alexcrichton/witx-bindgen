@@ -8,6 +8,7 @@ pub use wit_bindgen_rust_impl::{export, import};
 pub mod exports;
 mod futures;
 pub mod imports;
+mod task;
 
 // Re-export `bitflags` so that we can reference it from macros.
 #[doc(hidden)]
@@ -129,6 +130,7 @@ pub mod rt {
     use std::alloc::{self, Layout};
 
     pub use crate::futures::*;
+    pub use crate::task::*;
 
     #[no_mangle]
     unsafe extern "C" fn canonical_abi_realloc(
