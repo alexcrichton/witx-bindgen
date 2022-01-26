@@ -30,28 +30,20 @@ use self::cond::Cond;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 
 const ACTION_SELECT: u32 = 0;
 const ACTION_RETURN: u32 = 2;
-const ACTION_DONE: u32 = 3;
 
 const CAUSE_CHILD_WRITE: u32 = 1;
 const CAUSE_CHILD_RETURN: u32 = 2;
-const CAUSE_CHILD_DONE: u32 = 3;
 const CAUSE_SHARED_WRITE: u32 = 4;
 const CAUSE_SHARED_RETURN: u32 = 5;
 const CAUSE_COND_AWOKEN: u32 = 6;
 const CAUSE_COND_BROKEN: u32 = 7;
 
-const RETURN_NOT_HAPPENED: usize = 0;
-const RETURN_IN_PROGRESS: usize = 1;
-const RETURN_COMPLETE: usize = 2;
-
 pub mod sample {
-    use std::future::Future;
 
     pub mod generated_abi_glue_for_exports {
         use super::super::TaskAbi;
@@ -72,18 +64,9 @@ pub mod sample {
                 std::mem::forget(ret);
 
                 // communicate return value
-                let mut ret_area = [0; 2];
-                ret_area[0] = ret_0;
-                ret_area[1] = ret_1;
-                TaskAbi::signal_return(ret_area.as_ptr() as usize, || unsafe {
-                    // cleanup return value since it was never received
-                    let ptr = ret_area[0] as *mut u8;
-                    let len = ret_area[1] as usize;
-                    drop(String::from_utf8_unchecked(Vec::from_raw_parts(
-                        ptr, len, len,
-                    )));
-                })
-                .await
+                FUTURE_RET_AREA[0] = ret_0;
+                FUTURE_RET_AREA[1] = ret_1;
+                FUTURE_RET_AREA.as_ptr() as usize
             });
 
             // "return multiple values" through memory
@@ -94,65 +77,23 @@ pub mod sample {
         }
 
         #[no_mangle]
-        pub unsafe extern "C" fn export_with_cleanup(a: usize, b: usize) -> usize {
-            let (a, b, c) = TaskAbi::run(async move {
-                // deserialize canonical abi
-                let arg = String::from_utf8_unchecked(Vec::from_raw_parts(a as *mut u8, b, b));
-
-                // call the actual user-defined function
-                let (ret, cleanup) = super::export_with_cleanup(arg).await;
-
-                // serialize into the canonical abi
-                let ret = ret.into_bytes().into_boxed_slice();
-                let ret_0 = ret.as_ptr() as u64;
-                let ret_1 = ret.len() as u64;
-                std::mem::forget(ret);
-
-                // communicate return value
-                let mut ret_area = [0; 2];
-                ret_area[0] = ret_0;
-                ret_area[1] = ret_1;
-                let ret = TaskAbi::signal_return(ret_area.as_ptr() as usize, || unsafe {
-                    // cleanup return value since it was never received
-                    let ptr = ret_area[0] as *mut u8;
-                    let len = ret_area[1] as usize;
-                    drop(String::from_utf8_unchecked(Vec::from_raw_parts(
-                        ptr, len, len,
-                    )));
-                });
-
-                // execute both the return communication as well as the
-                // user-defined cleanup.
-                TaskAbi::join2(cleanup, ret).await
-            });
-
-            // "return multiple values" through memory
-            RET_AREA[0] = a as u64;
-            RET_AREA[1] = b as u64;
-            RET_AREA[2] = c as u64;
-            RET_AREA.as_ptr() as usize
+        pub unsafe extern "C" fn the_export_cancel(a: usize) {
+            TaskAbi::cancel_abi(a);
         }
 
+        // Note that these are 2 separate areas, one for the multi-value returns
+        // and one for futures. Both areas are expected to be immediatetly read
+        // by the canonical ABI upon signalling them.
         static mut RET_AREA: [u64; 8] = [0; 8];
+        static mut FUTURE_RET_AREA: [u64; 8] = [0; 8];
     }
 
     pub async fn the_export(a: String) -> String {
         imports::some_import(&a).await
     }
 
-    pub async fn export_with_cleanup(a: String) -> (String, impl Future<Output = ()>) {
-        let (result, cleanup) = imports::import_with_cleanup(&a).await;
-        let cleanup = async move {
-            println!("this is some cleanup");
-            cleanup.await;
-        };
-
-        (result, cleanup)
-    }
-
     pub mod imports {
-        use super::super::WasmTask;
-        use std::future::Future;
+        use super::super::TaskAbi;
 
         mod abi {
             #[link(wasm_import_module = "the_module_to_import_from")]
@@ -166,51 +107,12 @@ pub mod sample {
                 let mut ret = [0usize; 2];
                 let ret_ptr = ret.as_mut_ptr() as usize;
                 let task = abi::some_import(a.as_ptr() as usize, a.len(), ret_ptr);
-                let deserialize = || {
+                TaskAbi::finish_import(task, ret_ptr, || {
                     let ptr = ret[0] as *mut u8;
                     let len = ret[1] as usize;
                     String::from_utf8_unchecked(Vec::from_raw_parts(ptr, len, len))
-                };
-                match WasmTask::new(task) {
-                    Some(mut task) => {
-                        let ret = task
-                            .returned(ret_ptr, deserialize)
-                            .await
-                            .expect("task shouldn't be done previously");
-                        task.done().await;
-                        ret
-                    }
-                    None => deserialize(),
-                }
-            }
-        }
-
-        pub async fn import_with_cleanup(a: &str) -> (String, impl Future<Output = ()>) {
-            unsafe {
-                let mut ret = [0usize; 2];
-                let ret_ptr = ret.as_mut_ptr() as usize;
-                let task = abi::some_import(a.as_ptr() as usize, a.len(), ret_ptr);
-                let deserialize = || {
-                    let ptr = ret[0] as *mut u8;
-                    let len = ret[1] as usize;
-                    String::from_utf8_unchecked(Vec::from_raw_parts(ptr, len, len))
-                };
-                let (ret, task) = match WasmTask::new(task) {
-                    Some(mut task) => {
-                        let ret = task
-                            .returned(ret_ptr, deserialize)
-                            .await
-                            .expect("task shouldn't be done previously");
-                        (ret, Some(task))
-                    }
-                    None => (deserialize(), None),
-                };
-
-                (ret, async move {
-                    if let Some(mut task) = task {
-                        task.done().await;
-                    }
                 })
+                .await
             }
         }
     }
@@ -230,21 +132,25 @@ extern "C" {
 }
 
 pub struct TaskAbi {
-    future: Box<dyn Future<Output = ()>>,
+    future: Box<dyn Future<Output = usize>>,
     state: Arc<TaskState>,
 }
 
 pub struct TaskState {
     cond: Cond,
-    return_state: AtomicUsize,
-    return_area: AtomicUsize,
+    // return_state: AtomicUsize,
+    // return_area: AtomicUsize,
     children: Mutex<HashMap<u32, ChildState>>,
 }
 
 #[derive(Debug, Default)]
 struct ChildState {
     returned: bool,
-    done: bool,
+}
+
+enum Action {
+    Select(Box<TaskAbi>),
+    Return(usize),
 }
 
 impl TaskAbi {
@@ -252,15 +158,13 @@ impl TaskAbi {
     ///
     /// The actual callee is intended to be represented with the `future`
     /// provided.
-    pub fn run(future: impl Future<Output = ()> + 'static) -> (usize, u32, usize) {
+    pub fn run(future: impl Future<Output = usize> + 'static) -> (usize, u32, usize) {
         // Create the initial state for this task, which involves no children
         // but a default condvar to support cross-task wakeups.
-        let mut task = Box::new(TaskAbi {
+        let task = Box::new(TaskAbi {
             future: Box::new(future),
             state: Arc::new(TaskState {
                 cond: Cond::new(),
-                return_state: AtomicUsize::new(RETURN_NOT_HAPPENED),
-                return_area: AtomicUsize::new(0),
                 children: Mutex::default(),
             }),
         });
@@ -271,198 +175,72 @@ impl TaskAbi {
 
         // Perform the initial `poll` to determine what state this task is now
         // in, and then return the results.
-        let (action, y) = task.poll();
-        (Box::into_raw(task) as usize, action, y)
-    }
-
-    /// Rust helper function for yielding the return value of this task.
-    ///
-    /// This is an `async` function which resolves when the returned value is
-    /// received. If this async function is interrupted then the `cleanup`
-    /// callback provided is invoked to clean up the return value which is
-    /// stored in `ret_area` because it was never received.
-    pub async fn signal_return(ret_area: usize, cleanup: impl FnMut()) {
-        // First update our task's state to indicate that the return area has
-        // been provided and that the return operation is ready to be returned
-        // from the on-event callback.
-        tls::with(|state| {
-            let state = state.expect("return outside of task context");
-            state.return_area.store(ret_area, SeqCst);
-            let prev = state.return_state.swap(RETURN_IN_PROGRESS, SeqCst);
-            assert_eq!(prev, RETURN_NOT_HAPPENED);
-        });
-
-        SignalReturn(cleanup).await;
-
-        struct SignalReturn<F: FnMut()>(F);
-
-        impl<F> Future for SignalReturn<F>
-        where
-            F: FnMut(),
-        {
-            type Output = ();
-
-            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
-                tls::with(|state| {
-                    let state = state.expect("return outside of task context");
-                    match state.return_state.load(SeqCst) {
-                        // If the status of the return is complete, meaning it's
-                        // been acknowledged via the post-return callback, then
-                        // resolve the future.
-                        RETURN_COMPLETE => Poll::Ready(()),
-
-                        // If the return is still incomplete (in-progress) then
-                        // the return hasn't been acknowledged and we're not
-                        // done yet.
-                        //
-                        // TODO: like below in `Future for Child` this doesn't
-                        // pull out the waker from `Context` because it's
-                        // assumed this will get re-polled. Unsure if this is
-                        // actually ok or not.
-                        RETURN_IN_PROGRESS => Poll::Pending,
-
-                        s => panic!("invalid return state {}", s),
-                    }
-                })
-            }
-        }
-
-        impl<F> Drop for SignalReturn<F>
-        where
-            F: FnMut(),
-        {
-            fn drop(&mut self) {
-                let state = tls::with(|state| state.map(|s| s.return_state.load(SeqCst)));
-                if state == Some(RETURN_IN_PROGRESS) {
-                    (self.0)()
-                }
-            }
-        }
-    }
-
-    /// Helper function to join on `a` and `b`, basically simultaneously
-    /// awaiting both of their completions.
-    pub async fn join2(a: impl Future<Output = ()>, b: impl Future<Output = ()>) {
-        Join2 {
-            a,
-            b,
-            a_done: false,
-            b_done: false,
-        }
-        .await;
-
-        struct Join2<A, B> {
-            a: A,
-            a_done: bool,
-            b: B,
-            b_done: bool,
-        }
-
-        impl<A, B> Future for Join2<A, B>
-        where
-            A: Future<Output = ()>,
-            B: Future<Output = ()>,
-        {
-            type Output = ();
-
-            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-                let (a, b, a_done, b_done) = unsafe {
-                    let me = self.get_unchecked_mut();
-                    (
-                        Pin::new_unchecked(&mut me.a),
-                        Pin::new_unchecked(&mut me.b),
-                        &mut me.a_done,
-                        &mut me.b_done,
-                    )
-                };
-
-                if !*a_done {
-                    if let Poll::Ready(()) = a.poll(cx) {
-                        *a_done = true;
-                    }
-                }
-                if !*b_done {
-                    if let Poll::Ready(()) = b.poll(cx) {
-                        *b_done = true;
-                    }
-                }
-
-                if *a_done && *b_done {
-                    Poll::Ready(())
-                } else {
-                    Poll::Pending
-                }
-            }
+        match task.poll() {
+            Action::Select(task) => (Box::into_raw(task) as usize, ACTION_SELECT, 0),
+            Action::Return(val) => (0, ACTION_RETURN, val),
         }
     }
 
     /// ABI entry point for the `on-event` callback.
     pub unsafe fn on_event_abi(ptr: usize, cause: u32, x: u32) -> (u32, usize) {
-        Self::with_raw(ptr, |task| {
-            // Process `cause` and `x` by updating internal references to this
-            // task's state.
-            let mut children = task.state.children.lock().unwrap();
-            if cause & 0xf == CAUSE_CHILD_WRITE {
-                unimplemented!();
-                // let amt = cause >> 4;
-                // children
-                //     .get_mut(&x)
-                //     .unwrap()
-                //     .update_to(ChildState::Wrote(amt));
-            } else {
-                match cause {
-                    // Child completion is signaled through the `children` array
-                    // which will subsequently resolve futures that represent
-                    // calls to imported functions. When re-polled these futures
-                    // will consult this internal state.
-                    CAUSE_CHILD_RETURN => children.get_mut(&x).unwrap().returned = true,
-                    CAUSE_CHILD_DONE => children.get_mut(&x).unwrap().done = true,
+        let task = Self::raw_to_box(ptr);
 
-                    // Not implemented yet.
-                    CAUSE_SHARED_WRITE => unimplemented!(),
-                    CAUSE_SHARED_RETURN => unimplemented!(),
+        // Process `cause` and `x` by updating internal references to this
+        // task's state.
+        let mut children = task.state.children.lock().unwrap();
+        if cause & 0xf == CAUSE_CHILD_WRITE {
+            unimplemented!();
+            // let amt = cause >> 4;
+            // children
+            //     .get_mut(&x)
+            //     .unwrap()
+            //     .update_to(ChildState::Wrote(amt));
+        } else {
+            match cause {
+                // Child completion is signaled through the `children` array
+                // which will subsequently resolve futures that represent
+                // calls to imported functions. When re-polled these futures
+                // will consult this internal state.
+                CAUSE_CHILD_RETURN => children.get_mut(&x).unwrap().returned = true,
 
-                    // For now this means that our internal condvar was awoken
-                    // We're interested in future wakeups in this condvar so we
-                    // re-wait.
-                    CAUSE_COND_AWOKEN => task.state.cond.wait(),
+                // Not implemented yet.
+                CAUSE_SHARED_WRITE => unimplemented!(),
+                CAUSE_SHARED_RETURN => unimplemented!(),
 
-                    // TODO: how would this be exposed to Rust in a way that it can
-                    // act upon it?
-                    CAUSE_COND_BROKEN => {
-                        panic!("received `CondBroken` and cannot recover");
-                    }
+                // For now this means that our internal condvar was awoken
+                // We're interested in future wakeups in this condvar so we
+                // re-wait.
+                CAUSE_COND_AWOKEN => task.state.cond.wait(),
 
-                    cause => {
-                        if cfg!(debug_assertions) {
-                            panic!("unkonwn cause in on-event: {}", cause);
-                        }
+                // TODO: how would this be exposed to Rust in a way that it can
+                // act upon it?
+                CAUSE_COND_BROKEN => {
+                    panic!("received `CondBroken` and cannot recover");
+                }
+
+                cause => {
+                    if cfg!(debug_assertions) {
+                        panic!("unkonwn cause in on-event: {}", cause);
                     }
                 }
             }
-            drop(children);
-            task.poll()
-        })
-    }
+        }
+        drop(children);
 
-    /// ABI entry point for the `post-return` callback.
-    pub unsafe fn post_return_abi(ptr: usize) -> (u32, usize) {
-        Self::with_raw(ptr, |task| {
-            // Flag the internal return state as being complete now. This will
-            // resolve the future returned by `TaskAbi::signal_return` and allow
-            // further destructors/completion work to continue.
-            let prev = task.state.return_state.swap(RETURN_COMPLETE, SeqCst);
-            assert_eq!(prev, RETURN_IN_PROGRESS);
-
-            task.poll()
-        })
+        // Perform an internal future poll to determine what to do next
+        match task.poll() {
+            Action::Select(task) => {
+                drop(Box::into_raw(task)); // cancel the dtor
+                (ACTION_SELECT, 0)
+            }
+            Action::Return(val) => (ACTION_RETURN, val),
+        }
     }
 
     /// Performs a `poll` on the internal future to determine its current
     /// status. Returns an appropriate action representing what to do next with
     /// this future in the canonical abi.
-    fn poll(&mut self) -> (u32, usize) {
-        let prev_return_state = self.state.return_state.load(SeqCst);
+    fn poll(mut self: Box<Self>) -> Action {
         let waker = Waker::from(self.state.clone());
         let mut context = Context::from_waker(&waker);
 
@@ -478,23 +256,14 @@ impl TaskAbi {
 
         match tls::set(&self.state, || future.poll(&mut context)) {
             // If the future has completely resolved then there's nothing else
-            // to do and we're 100% done.
-            Poll::Ready(()) => (ACTION_DONE, 0),
+            // to do and we're 100% done. Destroy `self` since it's no longer
+            // needed and the retptr should be in a static area. Then return the
+            // retptr.
+            Poll::Ready(retptr) => Action::Return(retptr),
 
-            // If the future hasn't resolved yet then we check the state of the
-            // return value of this future. If our return state has changed then
-            // that should mean that the state is now `RETURN_IN_PROGRESS`. THe
-            // only stores to this state are in `signal_return` and
-            // `post_return_abi` below, and the only one of those that can
-            // happen while polling is `signal_return`.
-            Poll::Pending => {
-                if prev_return_state != self.state.return_state.load(SeqCst) {
-                    assert_eq!(prev_return_state, RETURN_NOT_HAPPENED);
-                    (ACTION_RETURN, self.state.return_area.load(SeqCst))
-                } else {
-                    (ACTION_SELECT, 0)
-                }
-            }
+            // If the future is still running then we're still in the "Select"
+            // state, so signal as such and we preserve our allocation.
+            Poll::Pending => Action::Select(self),
         }
     }
 
@@ -515,47 +284,27 @@ impl TaskAbi {
         Box::from_raw(ptr as *mut TaskAbi)
     }
 
-    /// Executes the `closure` provided with a temporary reference to the
-    /// `TaskAbi`.
-    ///
-    /// If the closure returns `ACTION_DONE` then the state is cleaned up and
-    /// dropped as well.
-    unsafe fn with_raw(
-        ptr: usize,
-        closure: impl FnOnce(&mut TaskAbi) -> (u32, usize),
-    ) -> (u32, usize) {
-        let (action, y) = closure(&mut *(ptr as *mut TaskAbi));
-        if action == ACTION_DONE {
-            drop(TaskAbi::raw_to_box(ptr));
+    /// Helper function used by generated code for imports to await the
+    /// completion of `task`.
+    pub async unsafe fn finish_import<T>(
+        task: u32,
+        retptr: usize,
+        mut deserialize: impl FnMut() -> T,
+    ) -> T {
+        // The child task actually completed immediately and no task was
+        // created, so the deserialize can happen immediately as `retptr` is
+        // already filled in.
+        if task == 0 {
+            return deserialize();
         }
-        (action, y)
-    }
-}
 
-impl Wake for TaskState {
-    fn wake(self: Arc<Self>) {
-        self.cond.notify(1);
-    }
-}
+        // Take ownership of the `task` identifier and schedule a destructor for
+        // when this goes out of scope with the `Drop for WasmTask`
+        // implementation.
+        let task = WasmTask(task);
 
-pub struct WasmTask {
-    id: u32,
-}
-
-impl WasmTask {
-    /// Creates a new wrapper `Child` around the `child` index owned by the
-    /// current task.
-    ///
-    /// The `retptr` argument is where to write the results of this child and is
-    /// the reason why this function is `unsafe`.
-    ///
-    /// Registers the current task to start listening for events on `child`.
-    unsafe fn new(id: u32) -> Option<WasmTask> {
-        if id == 0 {
-            return None;
-        }
-        // as bookeeping we update the list of children we're waiting on
-        // in the current task
+        // Insert state about our new child `task` which will get updated when a
+        // `ChildReturn` event happens.
         tls::with(|state| {
             // TODO: is this tls-always-here assumption valid?
             let state = state.expect("async work attempted outside of `Task::on_event`");
@@ -563,49 +312,51 @@ impl WasmTask {
                 .children
                 .lock()
                 .unwrap()
-                .insert(id, ChildState::default());
+                .insert(task.0, ChildState::default());
             debug_assert!(prev.is_none());
         });
 
-        Some(WasmTask { id })
-    }
-
-    /// Waits for this task to generate its returned value.
-    ///
-    /// The `ptr` provided is where the canonical abi representation of the
-    /// result is written, and `deserialize` is used to deserialize that
-    /// location into an actual type.
-    ///
-    /// Returns `None` if the task has already returned, and otherwise returns
-    /// `Some` with the result of the task when it's available.
-    async unsafe fn returned<T>(
-        &mut self,
-        ptr: usize,
-        deserialize: impl FnMut() -> T,
-    ) -> Option<T> {
-        // Check first to see if the child has already returned, meaning that we
-        // can't wait and `None` must be returned.
-        let already_returned = tls::with(|state| {
-            let children = state.unwrap().children.lock().unwrap();
-            children[&self.id].returned
-        });
-        if already_returned {
-            return None;
+        // Start listening for the return. The listener here is registered with
+        // a pointer to write into, then use a custom future to do the actual
+        // waiting.
+        task_listen(task.0, retptr);
+        return WaitForReturn {
+            task,
+            deserialize: Some(deserialize),
         }
+        .await;
 
-        // The child hasn't returned yet so we're going to start listening for
-        // the return. Register the listener here with a pointer to write into,
-        // then use a custom future to do the actual waiting.
-        task_listen(self.id, ptr);
-        return Some(WaitForReturn(self, Some(deserialize)).await);
+        struct WasmTask(u32);
+
+        impl Drop for WasmTask {
+            fn drop(&mut self) {
+                // First remove the internal state associated with this child in the
+                // current task.
+                tls::with(|state| {
+                    if let Some(state) = state {
+                        state.children.lock().unwrap().remove(&self.0);
+                    }
+                });
+
+                // Next the task can be fully dropped from the canonical ABI. Note that
+                // this will cancel the task if it's still in flight.
+                unsafe {
+                    task_drop(self.0);
+                }
+            }
+        }
 
         // Helper future to wait for `WasmTask` to return, using the closure
         // specified to deserialize the return value.
-        struct WaitForReturn<'a, F, T>(&'a mut WasmTask, Option<F>)
+        struct WaitForReturn<F, T>
         where
-            F: FnMut() -> T;
+            F: FnMut() -> T,
+        {
+            task: WasmTask,
+            deserialize: Option<F>,
+        }
 
-        impl<F, T> Future for WaitForReturn<'_, F, T>
+        impl<F, T> Future for WaitForReturn<F, T>
         where
             F: FnMut() -> T,
         {
@@ -614,14 +365,14 @@ impl WasmTask {
             fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<T> {
                 let (task, deserialize) = unsafe {
                     let me = self.get_unchecked_mut();
-                    (&mut me.0, &mut me.1)
+                    (&mut me.task, &mut me.deserialize)
                 };
                 tls::with(|state| {
                     let children = state.unwrap().children.lock().unwrap();
 
                     // If the child task has not entered the returned state yet
                     // then we're still pending.
-                    if !children[&task.id].returned {
+                    if !children[&task.0].returned {
                         return Poll::Pending;
                     }
 
@@ -630,7 +381,7 @@ impl WasmTask {
             }
         }
 
-        impl<F, T> Drop for WaitForReturn<'_, F, T>
+        impl<F, T> Drop for WaitForReturn<F, T>
         where
             F: FnMut() -> T,
         {
@@ -639,7 +390,7 @@ impl WasmTask {
                 // un-register the listen that was done when this was created
                 // since we're no longer interested in any events.
                 unsafe {
-                    task_ignore(self.0.id);
+                    task_ignore(self.task.0);
                 }
 
                 // Next check to see if the task actually returned and we didn't
@@ -653,8 +404,8 @@ impl WasmTask {
                 // doesn't mean that it won't get ignored in the future.
                 tls::with(|state| {
                     let children = state.unwrap().children.lock().unwrap();
-                    if children[&self.0.id].returned {
-                        if let Some(mut deserialize) = self.1.take() {
+                    if children[&self.task.0].returned {
+                        if let Some(mut deserialize) = self.deserialize.take() {
                             deserialize();
                         }
                     }
@@ -662,71 +413,11 @@ impl WasmTask {
             }
         }
     }
-
-    async fn done(&mut self) {
-        let already_done = tls::with(|state| {
-            let children = state.unwrap().children.lock().unwrap();
-            let child = &children[&self.id];
-            // TODO: this is a weird API, maybe a type-state thing can help
-            // here? Unsure otherwise what to do where we're interested in the
-            // done signal but not the returned signal. The `task_listen`
-            // function takes a pointer to write into and we otherwise don't
-            // have that available here.
-            assert!(child.returned);
-
-            child.done
-        });
-        if already_done {
-            return;
-        }
-
-        unsafe {
-            task_listen(self.id, 0);
-        }
-        WaitForDone(self).await;
-
-        struct WaitForDone<'a>(&'a mut WasmTask);
-
-        impl Future for WaitForDone<'_> {
-            type Output = ();
-
-            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
-                tls::with(|state| {
-                    let children = state.unwrap().children.lock().unwrap();
-                    if children[&self.0.id].returned {
-                        Poll::Ready(())
-                    } else {
-                        Poll::Pending
-                    }
-                })
-            }
-        }
-
-        impl Drop for WaitForDone<'_> {
-            fn drop(&mut self) {
-                unsafe {
-                    task_ignore(self.0.id);
-                }
-            }
-        }
-    }
 }
 
-impl Drop for WasmTask {
-    fn drop(&mut self) {
-        // First remove the internal state associated with this child in the
-        // current task.
-        tls::with(|state| {
-            if let Some(state) = state {
-                state.children.lock().unwrap().remove(&self.id);
-            }
-        });
-
-        // Next the task can be fully dropped from the canonical ABI. Note that
-        // this will cancel the task if it's still in flight.
-        unsafe {
-            task_drop(self.id);
-        }
+impl Wake for TaskState {
+    fn wake(self: Arc<Self>) {
+        self.cond.notify(1);
     }
 }
 
