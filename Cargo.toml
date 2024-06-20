@@ -68,7 +68,7 @@ default = [
   'markdown',
   'teavm-java',
   'go',
-  'csharp-naot',
+  'csharp',
 ]
 c = ['dep:wit-bindgen-c']
 rust = ['dep:wit-bindgen-rust']
