@@ -2,6 +2,9 @@
 
 extern crate alloc;
 
+use alloc::alloc::Layout;
+use core::ptr::NonNull;
+
 // Re-export `bitflags` so that we can reference it from macros.
 #[cfg(feature = "bitflags")]
 #[doc(hidden)]
@@ -116,3 +119,37 @@ pub fn run_ctors_once() {
 /// Support for using the Component Model Async ABI
 #[cfg(feature = "async")]
 pub mod async_support;
+
+/// Cleanup helper used to deallocate blocks of canonical ABI data from
+/// lowerings.
+pub struct Cleanup {
+    ptr: NonNull<u8>,
+    layout: Layout,
+}
+
+impl Cleanup {
+    /// Creates a new `Cleanup` to deallocate `ptr` which was allocated with
+    /// `layout`.
+    ///
+    /// Returns `None` if `ptr` is a null pointer.
+    ///
+    /// # Unsafety
+    ///
+    /// Unsafety as `ptr` must be either null or allocated previously with
+    /// `layout`.
+    pub unsafe fn new(ptr: *mut u8, layout: Layout) -> Option<Cleanup> {
+        let ptr = NonNull::new(ptr)?;
+        Some(Cleanup { ptr, layout })
+    }
+}
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        unsafe {
+            for i in 0..self.layout.size() {
+                *self.ptr.add(i).as_ptr() = 0xff;
+            }
+            alloc::alloc::dealloc(self.ptr.as_ptr(), self.layout);
+        }
+    }
+}

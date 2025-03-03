@@ -12,16 +12,14 @@ pub(super) struct FunctionBindgen<'a, 'b> {
     wasm_import_module: &'b str,
     pub src: Source,
     blocks: Vec<String>,
-    block_storage: Vec<(Source, Vec<(String, String)>)>,
+    block_storage: Vec<Source>,
     tmp: usize,
     pub needs_cleanup_list: bool,
-    cleanup: Vec<(String, String)>,
     pub import_return_pointer_area_size: usize,
     pub import_return_pointer_area_align: usize,
     pub handle_decls: Vec<String>,
     always_owned: bool,
     pub async_result_name: Option<String>,
-    emitted_cleanup: bool,
 }
 
 impl<'a, 'b> FunctionBindgen<'a, 'b> {
@@ -42,36 +40,24 @@ impl<'a, 'b> FunctionBindgen<'a, 'b> {
             block_storage: Vec::new(),
             tmp: 0,
             needs_cleanup_list: false,
-            cleanup: Vec::new(),
             import_return_pointer_area_size: 0,
             import_return_pointer_area_align: 0,
             handle_decls: Vec::new(),
             always_owned,
             async_result_name: None,
-            emitted_cleanup: false,
         }
     }
 
-    fn emit_cleanup(&mut self) {
-        if self.emitted_cleanup {
-            return;
-        }
-        self.emitted_cleanup = true;
-        for (ptr, layout) in mem::take(&mut self.cleanup) {
-            let alloc = self.gen.path_to_std_alloc_module();
-            self.push_str(&format!(
-                "if {layout}.size() != 0 {{\n{alloc}::dealloc({ptr}.cast(), {layout});\n}}\n"
-            ));
-        }
-        if self.needs_cleanup_list {
-            let alloc = self.gen.path_to_std_alloc_module();
-            self.push_str(&format!(
-                "for (ptr, layout) in cleanup_list {{\n
-                    if layout.size() != 0 {{\n
-                        {alloc}::dealloc(ptr.cast(), layout);\n
-                    }}\n
-                }}\n",
-            ));
+    fn cleanup(&mut self, ptr: &str, layout: &str) {
+        let tmp = self.tmp();
+        let rt = self.gen.gen.runtime_path();
+        uwriteln!(
+            self.src,
+            "let _cleanup{tmp} = {rt}::Cleanup::new({ptr}, {layout});"
+        );
+        if self.block_storage.len() > 0 {
+            self.needs_cleanup_list = true;
+            uwriteln!(self.src, "cleanup_list.extend(_cleanup{tmp});");
         }
     }
 
@@ -237,26 +223,12 @@ impl Bindgen for FunctionBindgen<'_, '_> {
 
     fn push_block(&mut self) {
         let prev_src = mem::take(&mut self.src);
-        let prev_cleanup = mem::take(&mut self.cleanup);
-        self.block_storage.push((prev_src, prev_cleanup));
+        self.block_storage.push(prev_src);
     }
 
     fn finish_block(&mut self, operands: &mut Vec<String>) {
-        if !self.cleanup.is_empty() {
-            self.needs_cleanup_list = true;
-            self.push_str("cleanup_list.extend_from_slice(&[");
-            for (ptr, layout) in mem::take(&mut self.cleanup) {
-                self.push_str("(");
-                self.push_str(&ptr);
-                self.push_str(", ");
-                self.push_str(&layout);
-                self.push_str("),");
-            }
-            self.push_str("]);\n");
-        }
-        let (prev_src, prev_cleanup) = self.block_storage.pop().unwrap();
+        let prev_src = self.block_storage.pop().unwrap();
         let src = mem::replace(&mut self.src, prev_src);
-        self.cleanup = prev_cleanup;
         let expr = match operands.len() {
             0 => "()".to_string(),
             1 => operands[0].clone(),
@@ -806,19 +778,18 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                     "if ptr.is_null()\n{{\n{alloc}::handle_alloc_error({layout});\n}}\nptr\n}}",
                 ));
                 self.push_str("else {\n::core::ptr::null_mut()\n};\n");
+                if realloc.is_none() {
+                    // If an allocator isn't requested then we must clean up the
+                    // allocation ourselves since our callee isn't taking
+                    // ownership.
+                    self.cleanup(&result, &layout);
+                }
                 self.push_str(&format!("for (i, e) in {vec}.into_iter().enumerate() {{\n",));
                 self.push_str(&format!("let base = {result}.add(i * {size});\n",));
                 self.push_str(&body);
                 self.push_str("\n}\n");
                 results.push(format!("{result}"));
                 results.push(len);
-
-                if realloc.is_none() {
-                    // If an allocator isn't requested then we must clean up the
-                    // allocation ourselves since our callee isn't taking
-                    // ownership.
-                    self.cleanup.push((result, layout));
-                }
             }
 
             Instruction::ListLift { element, .. } => {
@@ -999,7 +970,7 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                     "\
                             {result}
                         }};
-                        let result = {async_support}::first_poll({result}, |{params}| {{
+                        let result = {async_support}::first_poll({result}, move |{params}| {{
                     "
                 );
             }
@@ -1014,7 +985,6 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                     ",
                     operands.join(", ")
                 );
-                self.emit_cleanup();
                 self.src.push_str("});\n");
             }
 
@@ -1027,21 +997,18 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                 }
             }
 
-            Instruction::Return { amt, .. } => {
-                self.emit_cleanup();
-                match amt {
-                    0 => {}
-                    1 => {
-                        self.push_str(&operands[0]);
-                        self.push_str("\n");
-                    }
-                    _ => {
-                        self.push_str("(");
-                        self.push_str(&operands.join(", "));
-                        self.push_str(")\n");
-                    }
+            Instruction::Return { amt, .. } => match amt {
+                0 => {}
+                1 => {
+                    self.push_str(&operands[0]);
+                    self.push_str("\n");
                 }
-            }
+                _ => {
+                    self.push_str("(");
+                    self.push_str(&operands.join(", "));
+                    self.push_str(")\n");
+                }
+            },
 
             Instruction::I32Load { offset } => {
                 let tmp = self.tmp();
