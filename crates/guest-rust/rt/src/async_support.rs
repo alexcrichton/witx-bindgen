@@ -11,7 +11,6 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fmt::{self, Debug, Display};
 use std::future::Future;
-use std::mem;
 use std::pin::Pin;
 use std::ptr;
 use std::string::String;
@@ -22,7 +21,6 @@ use std::vec::Vec;
 use futures::channel::oneshot;
 use futures::future::FutureExt;
 use futures::stream::{FuturesUnordered, StreamExt};
-use once_cell::sync::Lazy;
 
 macro_rules! rtdebug {
     ($($f:tt)*) => {
@@ -40,11 +38,14 @@ mod abi_buffer;
 mod cabi;
 mod future_support;
 mod stream_support;
+mod subtask;
 mod waitable;
 
 pub use abi_buffer::*;
 pub use future_support::*;
 pub use stream_support::*;
+#[doc(hidden)]
+pub use subtask::Subtask;
 
 pub use futures;
 
@@ -53,13 +54,12 @@ type BoxFuture = Pin<Box<dyn Future<Output = ()> + 'static>>;
 /// Represents a task created by either a call to an async-lifted export or a
 /// future run using `block_on` or `poll_future`.
 struct FutureState {
-    /// Number of in-progress async-lowered import calls and/or stream/future reads/writes.
-    todo: usize,
     /// Remaining work to do (if any) before this task can be considered "done".
     ///
     /// Note that we won't tell the host the task is done until this is drained
-    /// and `todo` is zero.
+    /// and `waitables` is empty.
     tasks: Option<FuturesUnordered<BoxFuture>>,
+
     /// The waitable set containing waitables created by this task, if any.
     waitable_set: Option<u32>,
 
@@ -74,7 +74,6 @@ struct FutureState {
 impl FutureState {
     fn new(future: BoxFuture) -> FutureState {
         FutureState {
-            todo: 0,
             tasks: Some([future].into_iter().collect()),
             waitable_set: None,
             waitables: HashMap::new(),
@@ -101,7 +100,7 @@ impl FutureState {
     }
 
     fn remaining_work(&self) -> bool {
-        self.todo > 0 || !self.waitables.is_empty()
+        !self.waitables.is_empty()
     }
 }
 
@@ -140,10 +139,6 @@ impl Drop for FutureState {
 
 /// The current task being polled (or null if none).
 static mut CURRENT: *mut FutureState = ptr::null_mut();
-
-/// Map of any in-progress calls to async-lowered imports, keyed by the
-/// identifiers issued by the host.
-static mut CALLS: Lazy<HashMap<i32, oneshot::Sender<u32>>> = Lazy::new(HashMap::new);
 
 /// Any newly-deferred work queued by calls to the `spawn` function while
 /// polling the current task.
@@ -252,77 +247,11 @@ pub fn first_poll<T: 'static>(
     unsafe { callback_code(state, done) }
 }
 
-/// Await the completion of a call to an async-lowered import.
-#[doc(hidden)]
-pub async unsafe fn await_result(
-    import: unsafe extern "C" fn(*mut u8, *mut u8) -> i32,
-    params: *mut u8,
-    results: *mut u8,
-) {
-    let result = import(params, results) as u32;
-    let status = result >> 30;
-    let call = (result & !(0b11 << 30)) as i32;
-
-    if status != STATUS_RETURNED {
-        assert!(!CURRENT.is_null());
-        (*CURRENT).todo += 1;
-    }
-
-    let trap_on_drop = TrapOnDrop;
-
-    match status {
-        STATUS_STARTING | STATUS_STARTED => {
-            (*CURRENT).add_waitable(call as u32);
-            let (tx, rx) = oneshot::channel();
-            CALLS.insert(call, tx);
-            rx.await.unwrap();
-        }
-        STATUS_RETURNED => {}
-        _ => unreachable!("unrecognized async call status"),
-    }
-
-    mem::forget(trap_on_drop);
-
-    struct TrapOnDrop;
-
-    impl Drop for TrapOnDrop {
-        fn drop(&mut self) {
-            trap_because_of_future_drop();
-        }
-    }
-}
-
-#[cold]
-fn trap_because_of_future_drop() {
-    panic!(
-        "an imported function is being dropped/cancelled before being fully \
-         awaited, but that is not sound at this time so the program is going \
-         to be aborted; for more information see \
-         https://github.com/bytecodealliance/wit-bindgen/issues/1175"
-    );
-}
-
 /// stream/future read/write results defined by the Component Model ABI.
 mod results {
     pub const BLOCKED: u32 = 0xffff_ffff;
     pub const CLOSED: u32 = 0x8000_0000;
     pub const CANCELED: u32 = 0;
-}
-
-/// Call the `subtask.drop` canonical built-in function.
-fn subtask_drop(subtask: u32) {
-    #[cfg(not(target_arch = "wasm32"))]
-    unsafe fn subtask_drop(_: u32) {
-        unreachable!()
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    #[link(wasm_import_module = "$root")]
-    extern "C" {
-        #[link_name = "[subtask-drop]"]
-        fn subtask_drop(_: u32);
-    }
-    unsafe { subtask_drop(subtask) }
 }
 
 unsafe fn callback_code(state: *mut FutureState, done: bool) -> i32 {
@@ -359,42 +288,37 @@ unsafe fn callback_with_state(
             callback_code(state, done)
         }
         EVENT_CALL_STARTED => {
-            rtdebug!("EVENT_CALL_STARTED");
-            callback_code(state, false)
+            rtdebug!("EVENT_CALL_STARTED({event1:#x})");
+            deliver_waitable_event(state, event1 as u32, STATUS_STARTED)
         }
         EVENT_CALL_RETURNED => {
-            rtdebug!("EVENT_CALL_RETURNED({event1:#x}, {event2:#x})");
-            (*state).remove_waitable(event1 as _);
-
-            if let Some(call) = CALLS.remove(&event1) {
-                _ = call.send(event2 as _);
-            }
-
-            let done = poll(state).is_ready();
-
-            if event0 == EVENT_CALL_RETURNED {
-                subtask_drop(event1 as u32);
-            }
-
-            (*state).todo -= 1;
-
-            callback_code(state, done)
+            rtdebug!("EVENT_CALL_RETURNED({event1:#x})");
+            deliver_waitable_event(state, event1 as u32, STATUS_RETURNED)
         }
 
         EVENT_STREAM_READ | EVENT_STREAM_WRITE | EVENT_FUTURE_READ | EVENT_FUTURE_WRITE => {
             rtdebug!(
                 "EVENT_{{STREAM,FUTURE}}_{{READ,WRITE}}({event0:#x}, {event1:#x}, {event2:#x})"
             );
-            (*state).remove_waitable(event1 as u32);
-            let (ptr, callback) = (*state).waitables.remove(&(event1 as u32)).unwrap();
-            callback(ptr, event2 as u32);
-
-            let done = poll(state).is_ready();
-            callback_code(state, done)
+            deliver_waitable_event(state, event1 as u32, event2 as u32)
         }
 
         _ => unreachable!(),
     }
+}
+
+unsafe fn deliver_waitable_event(state: *mut FutureState, waitable: u32, code: u32) -> i32 {
+    // Deliver the `code` event to the `waitable` store within our map. This
+    // waitable should be present because it's part of the waitable set which is
+    // kept in-sync with our map.
+    (*state).remove_waitable(waitable);
+    let (ptr, callback) = (*state).waitables.remove(&waitable).unwrap();
+    callback(ptr, code);
+
+    // Next see if the main task is done yet after this event has been
+    // delivered.
+    let done = poll(state).is_ready();
+    callback_code(state, done)
 }
 
 /// Represents the Component Model `error-context` type.

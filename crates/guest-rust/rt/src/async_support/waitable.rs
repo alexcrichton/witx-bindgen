@@ -3,6 +3,7 @@
 
 use super::cabi;
 use std::ffi::c_void;
+use std::future::Future;
 use std::marker;
 use std::mem;
 use std::pin::Pin;
@@ -382,6 +383,14 @@ where
             // Should not be reachable as we always pass `Some(code)`.
             Poll::Pending => unreachable!(),
         }
+    }
+}
+
+impl<S: WaitableOp> Future for WaitableOperation<S> {
+    type Output = S::Result;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<S::Result> {
+        self.poll_complete(cx)
     }
 }
 
